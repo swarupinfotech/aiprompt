@@ -2,13 +2,13 @@ import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
 import { verifyAdminSession } from "@/lib/auth";
 
-export function middleware(request: NextRequest) {
+export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   if (pathname.startsWith("/admin") && !pathname.startsWith("/admin/login")) {
     const session = request.cookies.get("ai_prompt_admin_session")?.value;
 
-    if (!verifyAdminSession(session)) {
+    if (!(await verifyAdminSession(session))) {
       return NextResponse.redirect(new URL("/admin/login", request.url));
     }
   }

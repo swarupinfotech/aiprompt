@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { listPrompts } from "@/lib/db";
 
 export async function GET() {
-  const prompts = listPrompts(20).filter((prompt) => prompt.published);
+  const prompts = (await listPrompts(20)).filter((prompt) => prompt.published);
 
   return NextResponse.json({
     count: prompts.length,

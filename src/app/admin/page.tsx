@@ -14,8 +14,10 @@ async function AdminOverview() {
     redirect("/admin/login");
   }
 
-  const { promptCount, categoryCount, contactCount, totalViews } = getPromptStats();
-  const latestPrompts = getRecentPrompts(6);
+  const [{ promptCount, categoryCount, contactCount, totalViews }, latestPrompts] = await Promise.all([
+    getPromptStats(),
+    getRecentPrompts(6),
+  ]);
 
   const stats = [
     { label: "Published prompts", value: promptCount },

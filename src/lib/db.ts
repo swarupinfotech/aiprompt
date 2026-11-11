@@ -1,60 +1,77 @@
-import Database from "better-sqlite3";
+import { createClient, type Row } from "@libsql/client";
 import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
+import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import { categories as seedCategories, promptCatalog } from "@/lib/data";
 
-const dbPath = path.join(process.cwd(), "data", "app.db");
-mkdirSync(path.dirname(dbPath), { recursive: true });
+const localDbPath = path.join(process.cwd(), "data", "app.db");
+const localDbUrl = pathToFileURL(localDbPath).href;
+const databaseUrl = process.env.TURSO_DATABASE_URL || localDbUrl;
+const databaseToken = process.env.TURSO_AUTH_TOKEN;
 
-const db = new Database(dbPath);
+if (!process.env.TURSO_DATABASE_URL && process.env.NODE_ENV !== "production") {
+  mkdirSync(path.dirname(localDbPath), { recursive: true });
+}
 
-type PromptRecordRow = {
-  id: string;
-  slug: string;
-  title: string;
-  description: string;
-  category: string;
-  subcategory: string;
-  tags: string;
-  compatible_tools: string;
-  difficulty: string;
-  prompt_content: string;
-  customizable_vars: string;
-  instructions: string;
-  example_input: string;
-  example_output: string;
-  tips: string;
-  image_url: string;
-  image_alt: string;
-  seo_title: string;
-  meta_description: string;
-  copy_count: number;
-  view_count: number;
-  published: number;
-  created_at: string;
-  updated_at: string;
-};
+if (process.env.TURSO_DATABASE_URL && !databaseToken) {
+  throw new Error("TURSO_AUTH_TOKEN is required when TURSO_DATABASE_URL is set.");
+}
 
-export function initializeDatabase() {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS admin_users (
+const db = createClient({
+  url: databaseUrl,
+  ...(databaseToken ? { authToken: databaseToken } : {}),
+});
+
+function hashPassword(password: string) {
+  const salt = randomBytes(16);
+  const hash = scryptSync(password, salt, 64);
+  return `scrypt$${salt.toString("base64url")}$${hash.toString("base64url")}`;
+}
+
+function verifyPassword(password: string, storedPassword: string) {
+  const [scheme, saltValue, hashValue] = storedPassword.split("$");
+  if (scheme !== "scrypt" || !saltValue || !hashValue) return false;
+
+  const salt = Buffer.from(saltValue, "base64url");
+  const expected = Buffer.from(hashValue, "base64url");
+  if (expected.length !== 64) return false;
+
+  const actual = scryptSync(password, salt, expected.length);
+  return timingSafeEqual(actual, expected);
+}
+
+function stringValue(row: Row, column: string) {
+  const value = row[column];
+  return value == null ? "" : String(value);
+}
+
+function numberValue(row: Row, column: string) {
+  return Number(row[column] ?? 0);
+}
+
+async function initializeDatabase() {
+  if (process.env.NODE_ENV === "production" && (!process.env.TURSO_DATABASE_URL || !databaseToken)) {
+    throw new Error("Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN for the production database.");
+  }
+
+  await db.batch([
+    `CREATE TABLE IF NOT EXISTS admin_users (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       email TEXT UNIQUE,
       password TEXT,
       role TEXT DEFAULT 'admin',
       name TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS categories (
+    )`,
+    `CREATE TABLE IF NOT EXISTS categories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT UNIQUE,
       slug TEXT UNIQUE,
       description TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS prompts (
+    )`,
+    `CREATE TABLE IF NOT EXISTS prompts (
       id TEXT PRIMARY KEY,
       slug TEXT UNIQUE,
       title TEXT,
@@ -79,125 +96,183 @@ export function initializeDatabase() {
       published INTEGER DEFAULT 1,
       created_at TEXT,
       updated_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS contact_messages (
+    )`,
+    `CREATE TABLE IF NOT EXISTS contact_messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT,
       email TEXT,
       subject TEXT,
       message TEXT,
       created_at TEXT DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
+    )`,
+  ], "write");
 
-  const adminEmail = process.env.ADMIN_EMAIL || "admin@promptlibrary.com";
-  const adminPassword = process.env.ADMIN_PASSWORD || "admin123";
-  const adminExists = db.prepare("SELECT 1 FROM admin_users WHERE email = ?").get(adminEmail);
-  if (!adminExists) {
-    db.prepare("INSERT INTO admin_users (email, password, role, name) VALUES (?, ?, 'admin', 'Administrator')").run(adminEmail, adminPassword);
+  const adminEmail = process.env.ADMIN_EMAIL || (process.env.NODE_ENV === "production" ? "" : "admin@promptlibrary.com");
+  const adminPassword = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === "production" ? "" : "admin123");
+  if (!adminEmail || !adminPassword) {
+    throw new Error("Set ADMIN_EMAIL and ADMIN_PASSWORD before initializing the admin account.");
   }
 
-  const categoryResult = db.prepare("SELECT COUNT(*) AS total FROM categories").get() as { total?: number } | undefined;
-  const categoryCount = Number(categoryResult?.total ?? 0);
-  if (categoryCount === 0) {
-    for (const category of seedCategories) {
+  await db.execute({
+    sql: "INSERT OR IGNORE INTO admin_users (email, password, role, name) VALUES (?, ?, 'admin', 'Administrator')",
+    args: [adminEmail, hashPassword(adminPassword)],
+  });
+
+  const categoryResult = await db.execute("SELECT COUNT(*) AS total FROM categories");
+  if (numberValue(categoryResult.rows[0], "total") < seedCategories.length) {
+    await db.batch(seedCategories.map((category) => {
       const slug = category.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-      db.prepare("INSERT INTO categories (name, slug, description) VALUES (?, ?, ?)").run(category, slug, `Curated prompts for ${category.toLowerCase()} workflows.`);
-    }
+      return {
+        sql: "INSERT OR IGNORE INTO categories (name, slug, description) VALUES (?, ?, ?)",
+        args: [category, slug, `Curated prompts for ${category.toLowerCase()} workflows.`],
+      };
+    }), "write");
   }
 
-  const promptResult = db.prepare("SELECT COUNT(*) AS total FROM prompts").get() as { total?: number } | undefined;
-  const promptCount = Number(promptResult?.total ?? 0);
-  if (promptCount === 0) {
-    const insertPrompt = db.prepare(`
-      INSERT INTO prompts (
+  const promptResult = await db.execute("SELECT COUNT(*) AS total FROM prompts");
+  if (numberValue(promptResult.rows[0], "total") < promptCatalog.length) {
+    const insertStatements = promptCatalog.map((prompt) => ({
+      sql: `INSERT OR IGNORE INTO prompts (
         id, slug, title, description, category, subcategory, tags, compatible_tools,
         difficulty, prompt_content, customizable_vars, instructions, example_input,
         example_output, tips, image_url, image_alt, seo_title, meta_description,
         copy_count, view_count, published, created_at, updated_at
-      ) VALUES (
-        @id, @slug, @title, @description, @category, @subcategory, @tags, @compatibleTools,
-        @difficulty, @promptContent, @customizableVars, @instructions, @exampleInput,
-        @exampleOutput, @tips, @imageUrl, @imageAlt, @seoTitle, @metaDescription,
-        @copyCount, @viewCount, @published, @createdAt, @updatedAt
-      )
-    `);
+      ) VALUES (${new Array(24).fill("?").join(", ")})`,
+      args: [
+        prompt.id,
+        prompt.slug,
+        prompt.title,
+        prompt.description,
+        prompt.category,
+        prompt.subcategory,
+        JSON.stringify(prompt.tags),
+        JSON.stringify(prompt.compatibleTools),
+        prompt.difficulty,
+        prompt.promptContent,
+        JSON.stringify(prompt.customizableVars),
+        prompt.instructions,
+        prompt.exampleInput,
+        prompt.exampleOutput,
+        prompt.tips,
+        prompt.imageUrl,
+        prompt.imageAlt,
+        prompt.seoTitle,
+        prompt.metaDescription,
+        prompt.copyCount,
+        prompt.viewCount,
+        prompt.published ? 1 : 0,
+        prompt.createdAt,
+        prompt.updatedAt,
+      ],
+    }));
 
-    for (const prompt of promptCatalog) {
-      insertPrompt.run({
-        id: prompt.id,
-        slug: prompt.slug,
-        title: prompt.title,
-        description: prompt.description,
-        category: prompt.category,
-        subcategory: prompt.subcategory,
-        tags: JSON.stringify(prompt.tags),
-        compatibleTools: JSON.stringify(prompt.compatibleTools),
-        difficulty: prompt.difficulty,
-        promptContent: prompt.promptContent,
-        customizableVars: JSON.stringify(prompt.customizableVars),
-        instructions: prompt.instructions,
-        exampleInput: prompt.exampleInput,
-        exampleOutput: prompt.exampleOutput,
-        tips: prompt.tips,
-        imageUrl: prompt.imageUrl,
-        imageAlt: prompt.imageAlt,
-        seoTitle: prompt.seoTitle,
-        metaDescription: prompt.metaDescription,
-        copyCount: prompt.copyCount,
-        viewCount: prompt.viewCount,
-        published: prompt.published ? 1 : 0,
-        createdAt: prompt.createdAt,
-        updatedAt: prompt.updatedAt,
-      });
+    for (let index = 0; index < insertStatements.length; index += 100) {
+      await db.batch(insertStatements.slice(index, index + 100), "write");
     }
   }
 }
 
-initializeDatabase();
+let databaseReady: Promise<void> | undefined;
 
-export function getAdminUser(email: string) {
-  return db.prepare("SELECT * FROM admin_users WHERE email = ?").get(email) as { email: string; password: string; role: string; name: string } | undefined;
+function ensureDatabaseReady() {
+  if (!databaseReady) {
+    databaseReady = initializeDatabase();
+  }
+  return databaseReady;
 }
 
-export function listPrompts(limit = 20) {
-  const rows = db.prepare("SELECT * FROM prompts ORDER BY created_at DESC LIMIT ?").all(limit) as PromptRecordRow[];
-  return rows.map((row) => ({
-    ...row,
-    tags: JSON.parse(String(row.tags ?? "[]")),
-    compatibleTools: JSON.parse(String(row.compatible_tools ?? "[]")),
-    customizableVars: JSON.parse(String(row.customizable_vars ?? "[]")),
-    published: Number(row.published ?? 0) === 1,
-    category: row.category,
-    copy_count: row.copy_count,
-    view_count: row.view_count,
+export async function verifyAdminCredentials(email: string, password: string) {
+  await ensureDatabaseReady();
+  const result = await db.execute({
+    sql: "SELECT password, role FROM admin_users WHERE email = ?",
+    args: [email],
+  });
+  const user = result.rows[0];
+  if (!user || stringValue(user, "role") !== "admin") return false;
+
+  const storedPassword = stringValue(user, "password");
+  if (verifyPassword(password, storedPassword)) return true;
+
+  if (storedPassword === password) {
+    await db.execute({
+      sql: "UPDATE admin_users SET password = ? WHERE email = ?",
+      args: [hashPassword(password), email],
+    });
+    return true;
+  }
+
+  return false;
+}
+
+export async function listPrompts(limit = 20) {
+  await ensureDatabaseReady();
+  const result = await db.execute({
+    sql: "SELECT * FROM prompts ORDER BY created_at DESC LIMIT ?",
+    args: [limit],
+  });
+
+  return result.rows.map((row) => ({
+    id: stringValue(row, "id"),
+    slug: stringValue(row, "slug"),
+    title: stringValue(row, "title"),
+    description: stringValue(row, "description"),
+    category: stringValue(row, "category"),
+    subcategory: stringValue(row, "subcategory"),
+    tags: JSON.parse(stringValue(row, "tags") || "[]"),
+    compatibleTools: JSON.parse(stringValue(row, "compatible_tools") || "[]"),
+    difficulty: stringValue(row, "difficulty"),
+    prompt_content: stringValue(row, "prompt_content"),
+    customizableVars: JSON.parse(stringValue(row, "customizable_vars") || "[]"),
+    instructions: stringValue(row, "instructions"),
+    example_input: stringValue(row, "example_input"),
+    example_output: stringValue(row, "example_output"),
+    tips: stringValue(row, "tips"),
+    image_url: stringValue(row, "image_url"),
+    image_alt: stringValue(row, "image_alt"),
+    seo_title: stringValue(row, "seo_title"),
+    meta_description: stringValue(row, "meta_description"),
+    published: numberValue(row, "published") === 1,
+    copy_count: numberValue(row, "copy_count"),
+    view_count: numberValue(row, "view_count"),
   }));
 }
 
-export function getPromptStats() {
-  const promptResult = db.prepare("SELECT COUNT(*) AS total FROM prompts").get() as { total?: number } | undefined;
-  const categoryResult = db.prepare("SELECT COUNT(*) AS total FROM categories").get() as { total?: number } | undefined;
-  const contactResult = db.prepare("SELECT COUNT(*) AS total FROM contact_messages").get() as { total?: number } | undefined;
-  const viewsResult = db.prepare("SELECT COALESCE(SUM(view_count), 0) AS total FROM prompts").get() as { total?: number } | undefined;
+export async function getPromptStats() {
+  await ensureDatabaseReady();
+  const [prompts, categories, contacts, views] = await Promise.all([
+    db.execute("SELECT COUNT(*) AS total FROM prompts"),
+    db.execute("SELECT COUNT(*) AS total FROM categories"),
+    db.execute("SELECT COUNT(*) AS total FROM contact_messages"),
+    db.execute("SELECT COALESCE(SUM(view_count), 0) AS total FROM prompts"),
+  ]);
 
-  const promptCount = Number(promptResult?.total ?? 0);
-  const categoryCount = Number(categoryResult?.total ?? 0);
-  const contactCount = Number(contactResult?.total ?? 0);
-  const totalViews = Number(viewsResult?.total ?? 0);
-  return { promptCount, categoryCount, contactCount, totalViews };
+  return {
+    promptCount: numberValue(prompts.rows[0], "total"),
+    categoryCount: numberValue(categories.rows[0], "total"),
+    contactCount: numberValue(contacts.rows[0], "total"),
+    totalViews: numberValue(views.rows[0], "total"),
+  };
 }
 
-export function createContactMessage(data: { name: string; email: string; subject: string; message: string }) {
-  db.prepare("INSERT INTO contact_messages (name, email, subject, message) VALUES (?, ?, ?, ?)").run(data.name, data.email, data.subject, data.message);
+export async function createContactMessage(data: { name: string; email: string; subject: string; message: string }) {
+  await ensureDatabaseReady();
+  await db.execute({
+    sql: "INSERT INTO contact_messages (name, email, subject, message) VALUES (?, ?, ?, ?)",
+    args: [data.name, data.email, data.subject, data.message],
+  });
 }
 
-export function getRecentPrompts(limit = 6) {
-  const rows = db.prepare("SELECT * FROM prompts ORDER BY created_at DESC LIMIT ?").all(limit) as PromptRecordRow[];
-  return rows.map((row) => ({
-    id: row.id,
-    title: row.title,
-    category: { name: row.category },
-    published: Number(row.published ?? 0) === 1,
+export async function getRecentPrompts(limit = 6) {
+  await ensureDatabaseReady();
+  const result = await db.execute({
+    sql: "SELECT id, title, category, published FROM prompts ORDER BY created_at DESC LIMIT ?",
+    args: [limit],
+  });
+
+  return result.rows.map((row) => ({
+    id: stringValue(row, "id"),
+    title: stringValue(row, "title"),
+    category: { name: stringValue(row, "category") },
+    published: numberValue(row, "published") === 1,
   }));
 }

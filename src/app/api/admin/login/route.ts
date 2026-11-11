@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { setAdminSessionCookie } from "@/lib/auth";
-import { getAdminUser } from "@/lib/db";
+import { verifyAdminCredentials } from "@/lib/db";
 
 export async function POST(request: Request) {
   const { email, password } = (await request.json().catch(() => ({}))) as {
@@ -9,13 +9,11 @@ export async function POST(request: Request) {
   };
 
   const normalizedEmail = email ?? "";
-  const user = normalizedEmail ? getAdminUser(normalizedEmail) : undefined;
-
-  if (!user || !password || user.password !== password) {
+  if (!normalizedEmail || !password || !(await verifyAdminCredentials(normalizedEmail, password))) {
     return NextResponse.json({ error: "Invalid admin credentials." }, { status: 401 });
   }
 
   const response = NextResponse.json({ ok: true, message: "Signed in successfully." });
-  response.cookies.set(setAdminSessionCookie(normalizedEmail));
+  response.cookies.set(await setAdminSessionCookie(normalizedEmail));
   return response;
 }

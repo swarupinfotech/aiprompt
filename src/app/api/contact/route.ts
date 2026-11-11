@@ -10,11 +10,11 @@ const contactSchema = z.object({
 });
 
 export async function POST(request: Request) {
-  try {
-    const payload = contactSchema.parse(await request.json());
-    createContactMessage(payload);
-    return NextResponse.json({ ok: true, message: "Contact message saved.", payload }, { status: 201 });
-  } catch {
+  const parsedPayload = contactSchema.safeParse(await request.json().catch(() => null));
+  if (!parsedPayload.success) {
     return NextResponse.json({ error: "Please provide valid contact details." }, { status: 400 });
   }
+
+  await createContactMessage(parsedPayload.data);
+  return NextResponse.json({ ok: true, message: "Contact message saved.", payload: parsedPayload.data }, { status: 201 });
 }
